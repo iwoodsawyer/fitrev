@@ -1,2 +1,2 @@
 # fitrev
-Extreme Value (EV) regression for fitting generalized extreme value models.
+Extreme Value (EV) regression for fitting generalized extreme value models. The function fitrev fits a Gaussian process model for generalized extreme value (GEV or Gumbel) regression. This function delegates fitting to RegressionEV class. This class provides a fitrgp-style API for extreme value Gaussian process regression. It is intended to resemble MATLAB's RegressionGP and fitrgp interface and conventions, but implements regression via approximate inference using Laplace with GEV/Gumbel distribution.

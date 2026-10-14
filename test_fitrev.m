@@ -486,5 +486,127 @@ classdef test_fitrev < matlab.unittest.TestCase
             testCase.verifyGreaterThan(mdl.Sigma, 0);
         end
 
+        function testGumbelPredictiveMomentsAtUncorrelatedPoint(testCase)
+            x = (0:5)';
+            y = 2 + 0.4*x;
+            sigma = 0.8;
+            mdl = fitrev(x, y, ...
+                'FitMethod', 'none', ...
+                'BasisFunction', 'constant', ...
+                'Beta', 2, ...
+                'KernelParameters', [1; 0.1], ...
+                'Sigma', sigma, ...
+                'Shape', 0, ...
+                'Standardize', false, ...
+                'Verbose', 0);
+
+            [yhat, ysd] = predict(mdl, 1e4);
+            expectedMean = 2 + 0.5772156649015329*sigma;
+            expectedVariance = 0.1^2 + (pi^2/6)*sigma^2;
+
+            testCase.verifyEqual(yhat, expectedMean, 'AbsTol', 1e-10);
+            testCase.verifyEqual(ysd^2, expectedVariance, 'AbsTol', 1e-10);
+        end
+
+        function testEPPredictionIsFinite(testCase)
+            rng(7);
+            mdl = fitrev(testCase.X_data(1:30,1), testCase.Y_gumbel(1:30), ...
+                'Inference', 'EP', ...
+                'FitMethod', 'none', ...
+                'InferenceOptions', struct('MaxIter', 30, 'Tol', 1e-6, ...
+                    'Damping', 0.6, 'NumGHPoints', 30), ...
+                'Verbose', 0);
+
+            [yhat, ysd, ci] = predict(mdl, testCase.X_data(31:35,1));
+            testCase.verifyTrue(all(isfinite(yhat)));
+            testCase.verifyTrue(all(isfinite(ysd) & ysd >= 0));
+            testCase.verifyTrue(all(isfinite(ci(:))));
+            testCase.verifyTrue(all(ci(:,1) <= yhat & yhat <= ci(:,2)));
+        end
+
+        function testEPEvidenceMatchesSingleObservationIntegral(testCase)
+            sigma = 0.8;
+            priorMean = 1.2;
+            priorSD = 0.5;
+            y = 1.4;
+            options = struct('MaxIter', 100, 'Tol', 1e-9, ...
+                'Damping', 0.5, 'NumGHPoints', 100);
+            mdl = fitrev(0, y, 'FitMethod', 'none', 'Inference', 'EP', ...
+                'Sigma', sigma, 'Beta', priorMean, ...
+                'KernelParameters', [1; priorSD], 'InferenceOptions', options);
+            density = @(f) exp(-log(sigma) - (y-f)/sigma - exp(-(y-f)/sigma)) .* ...
+                exp(-0.5*((f-priorMean)/priorSD).^2)/(sqrt(2*pi)*priorSD);
+            expected = log(integral(density, -Inf, Inf, 'AbsTol', 1e-12));
+            testCase.verifyEqual(mdl.LogLikelihood, expected, 'AbsTol', 1e-7);
+            testCase.verifyLessThanOrEqual(mdl.LogLikelihood, -log(sigma)-1);
+        end
+
+        function testEPWeightsExponentiateLikelihood(testCase)
+            sigma = 0.8;
+            priorMean = 1.2;
+            priorSD = 0.5;
+            y = 1.4;
+            mdl = fitrev(0, y, 'FitMethod', 'none', 'Inference', 'EP', ...
+                'Sigma', sigma, 'Beta', priorMean, 'Weights', 2, ...
+                'KernelParameters', [1; priorSD], ...
+                'InferenceOptions', struct('MaxIter', 100, 'Tol', 1e-9, ...
+                'Damping', 0.5, 'NumGHPoints', 100));
+            density = @(f) exp(2*(-log(sigma) - (y-f)/sigma - exp(-(y-f)/sigma))) .* ...
+                exp(-0.5*((f-priorMean)/priorSD).^2)/(sqrt(2*pi)*priorSD);
+            expected = log(integral(density, -Inf, Inf, 'AbsTol', 1e-12));
+            testCase.verifyEqual(mdl.LogLikelihood, expected, 'AbsTol', 1e-7);
+        end
+
+        function testEPQuadratureResolvesDistantNarrowLikelihood(testCase)
+            sigma = 0.1;
+            y = 6;
+            mdl = fitrev(0, y, 'FitMethod', 'none', 'Inference', 'EP', ...
+                'Sigma', sigma, 'Beta', 0, 'KernelParameters', [1; 1], ...
+                'InferenceOptions', struct('MaxIter', 100, 'Tol', 1e-9, ...
+                'Damping', 0.5, 'NumGHPoints', 100));
+            density = @(f) exp(-log(sigma) - (y-f)/sigma - exp(-(y-f)/sigma)) .* ...
+                exp(-0.5*f.^2)/sqrt(2*pi);
+            normalizer = integral(density, -5, 15, 'AbsTol', 1e-16, 'RelTol', 1e-10);
+            meanLocation = integral(@(f) f.*density(f), -5, 15, ...
+                'AbsTol', 1e-16, 'RelTol', 1e-10) / normalizer;
+            varianceLocation = integral(@(f) (f-meanLocation).^2.*density(f), -5, 15, ...
+                'AbsTol', 1e-16, 'RelTol', 1e-10) / normalizer;
+            [responseMean, responseSD] = predict(mdl, 0);
+            testCase.verifyEqual(mdl.LogLikelihood, log(normalizer), 'AbsTol', 1e-5);
+            testCase.verifyEqual(responseMean, meanLocation + 0.5772156649015329*sigma, ...
+                'AbsTol', 1e-5);
+            testCase.verifyEqual(responseSD^2, varianceLocation + (pi^2/6)*sigma^2, ...
+                'AbsTol', 1e-5);
+        end
+
+        function testEPDeterministicEvidence(testCase)
+            x = (1:8)';
+            y = 2 + sin(x);
+            args = {'Inference', 'EP', 'FitMethod', 'none', 'Beta', 2, ...
+                'Sigma', 1, 'KernelParameters', [1; 0.5]};
+            rng(1);
+            first = fitrev(x, y, args{:});
+            rng(2);
+            second = fitrev(x, y, args{:});
+            testCase.verifyEqual(first.LogLikelihood, second.LogLikelihood);
+            testCase.verifyEqual(predict(first, x), predict(second, x));
+        end
+
+        function testInformationCriteriaUseGevLikelihood(testCase)
+            x = (1:10)';
+            y = 2 + sin(x);
+            mdl = fitrev(x, y, 'Beta', 2, 'Sigma', 1, ...
+                'KernelParameters', [1; 0.5], ...
+                'ConstantKernelParameters', true(2,1), 'Verbose', 0);
+            mu = predict(mdl, x) - 0.5772156649015329*mdl.Sigma;
+            z = (y-mu)/mdl.Sigma;
+            ll = sum(-log(mdl.Sigma)-z-exp(-z));
+            k = numel(mdl.Beta);
+            testCase.verifyEqual(mdl.criterion('CriterionFun', 'AIC'), ...
+                2*k-2*ll, 'AbsTol', 1e-10);
+            testCase.verifyEqual(mdl.criterion('CriterionFun', 'BIC'), ...
+                k*log(numel(y))-2*ll, 'AbsTol', 1e-10);
+        end
+
     end
 end

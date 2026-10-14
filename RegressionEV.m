@@ -240,6 +240,13 @@ classdef RegressionEV
             % Explicit basis mean: m(x)=H(x)*Beta. This matches fitrgp style.
             Ha = RegressionEV.basisMatrix(XaStd, args.BasisFunction);
             beta0 = RegressionEV.ensureBetaSize(args.Beta, size(Ha,2));
+            if isempty(args.Beta) && ~strcmpi(args.FitMethod, 'none') && ~isempty(Ha)
+                shift = RegressionEV.gevMeanShift(args.Sigma, args.Shape);
+                if isfinite(shift)
+                    beta0 = Ha \ (ya - shift);
+                    args.Beta = beta0;
+                end
+            end
             this.Beta = beta0;
 
             % ---- FitMethod='none' => no hyperparameter estimation ----
@@ -472,6 +479,9 @@ classdef RegressionEV
             % Name-value:
             %   'CriterionFun': 'GCV' (default) | 'AIC' | 'AICc' | 'BIC' |
             %                   'CAIC' | 'LOOCV' | 'WAIC'
+            %   AIC/BIC variants use plug-in GEV likelihood at the posterior
+            %   location and count free explicit parameters, not GP latent degrees
+            %   of freedom. WAIC is a legacy Gaussian predictive-score proxy.
 
             if isempty(this.X) || isempty(this.Y)
                 error('RegressionEV:Compact', 'Unsupported for compacted model');
@@ -482,7 +492,13 @@ classdef RegressionEV
             ip.parse(varargin{:});
             criterionFun = ip.Results.CriterionFun;
 
-            k_hyper = numel(this.KernelInformation.KernelParameters) + numel(this.Beta) + 2;
+            mp = this.ModelParameters;
+            ck = mp.ConstantKernelParameters;
+            if isempty(ck)
+                ck = false(numel(this.KernelInformation.KernelParameters),1);
+            end
+            k_hyper = sum(~ck(:)) + numel(this.Beta) + ...
+                ~mp.ConstantSigma + ~mp.ConstantShape + ~mp.ConstantLambda;
             n_obs = this.NumObservations;
             n_act = sum(this.IsActiveSetVector);
             post = this.Posterior_;
@@ -494,8 +510,16 @@ classdef RegressionEV
             sigma2 = max(ysd.^2, eps);
             sigma2(~isfinite(sigma2)) = NaN;
 
-            % Log Likelihood
+            % Gaussian predictive scores are used only by the legacy WAIC proxy.
             L = -0.5 * (log(2*pi*sigma2) + ((yTrue - yPred).^2) ./ sigma2);
+            if any(strcmpi(string(criterionFun), ["aic","aicc","bic","caic"]))
+                shift = RegressionEV.gevMeanShift(this.Sigma, this.Shape);
+                if ~isfinite(shift) || ~isempty(this.ResponseTransform)
+                    error('RegressionEV:UnsupportedCriterion', ...
+                        'Likelihood criteria require a finite response mean and no ResponseTransform.');
+                end
+                L = RegressionEV.gevLogLikelihood(yPred - shift, yTrue, this.Sigma, this.Shape);
+            end
 
             switch lower(string(criterionFun))
                 case "aic"
@@ -504,7 +528,11 @@ classdef RegressionEV
                 case "aicc"
                     % Corrected Akaike Information Criterion
                     C = 2*k_hyper - 2*sum(w .* L, 'omitnan');
-                    C = C + (2*k_hyper*(k_hyper + 1)) / max(1, n_obs - k_hyper - 1);
+                    if n_obs <= k_hyper + 1
+                        C = Inf;
+                    else
+                        C = C + (2*k_hyper*(k_hyper + 1)) / (n_obs - k_hyper - 1);
+                    end
                 case "bic"
                     % Bayesian Information Criterion
                     C = k_hyper*log(n_obs) - 2*sum(w .* L, 'omitnan');
@@ -769,16 +797,28 @@ classdef RegressionEV
             % Inference iteration defaults
             opt = args.InferenceOptions;
             if ~isfield(opt, 'MaxIter')
-                opt.MaxIter = RegressionEV.DEFAULT_MAX_ITER;
+                if strcmp(args.InferenceMethod, 'EP')
+                    opt.MaxIter = 100;
+                else
+                    opt.MaxIter = RegressionEV.DEFAULT_MAX_ITER;
+                end
             end
             if ~isfield(opt, 'Tol')
                 opt.Tol = RegressionEV.DEFAULT_TOL;
             end
             if ~isfield(opt, 'Damping')
-                opt.Damping = RegressionEV.DEFAULT_DAMPING;
+                if strcmp(args.InferenceMethod, 'EP')
+                    opt.Damping = 0.5;
+                else
+                    opt.Damping = RegressionEV.DEFAULT_DAMPING;
+                end
             end
             if ~isfield(opt, 'NumGHPoints')
-                opt.NumGHPoints = RegressionEV.DEFAULT_GH_POINTS;
+                if strcmp(args.InferenceMethod, 'EP')
+                    opt.NumGHPoints = 40;
+                else
+                    opt.NumGHPoints = RegressionEV.DEFAULT_GH_POINTS;
+                end
             end
             args.InferenceOptions = opt;
         end
@@ -1712,6 +1752,10 @@ classdef RegressionEV
             % Initialize Posterior (Starts as Prior)
             Sigma = K;
             mu = m;
+            priorFactor = RegressionEV.cholSafe(K);
+            if any(~isfinite(priorFactor(:)))
+                error('RegressionEV:EPInvalidPrior', 'EP requires a positive definite finite prior covariance.');
+            end
 
             [ghx, ghw] = RegressionEV.gaussHermite(opt.NumGHPoints);
 
@@ -1721,28 +1765,33 @@ classdef RegressionEV
                 tau_old_sweep = tau;
                 nu_old_sweep = nu;
 
-                % 1. Randomizing order improves stability and prevents local oscillations
-                perm = randperm(n); 
+                % Fixed order keeps evidence evaluations deterministic for optimization.
+                perm = 1:n;
     
                 for i = perm
                     sig_i = Sigma(i,i);
 
                     % 2. Cavity Distribution (Divide Posterior by Site i)
                     % precision_cav = precision_post - site_precision
-                    denom = max(1 - sig_i*tau(i), sqrt_eps);
-                    var_cav = max(sig_i / denom, sqrt_eps);
+                    denom = 1 - sig_i*tau(i);
+                    if ~isfinite(denom) || denom <= 0
+                        error('RegressionEV:EPInvalidCavity', ...
+                            'EP cavity precision is nonpositive or nonfinite at observation %d.', i);
+                    end
+                    var_cav = max(sig_i / denom, 1e-12);  % Clamp minimum
                     mu_cav = (mu(i) - sig_i*nu(i)) / denom;
    
                     % 3. Moment Matching
-                    [mu_hat, var_hat, logZi] = RegressionEV.gevTiltedMoments(mu_cav, var_cav, y(i), sigma, shape, ghx, ghw);
+                    [mu_hat, var_hat, logZi] = RegressionEV.gevTiltedMoments(mu_cav, var_cav, y(i), sigma, shape, ghx, ghw, w(i));
                     if ~isfinite(logZi) || ~isfinite(var_hat) || ~isfinite(mu_hat)
-                        continue;
+                        error('RegressionEV:EPInvalidMoments', ...
+                            'EP tilted moments are nonfinite at observation %d.', i);
                     end
 
                     % 4. Update Site Parameters with CLAMPING and DAMPING
                     % Fix: Corrected variable name from nu_nu to nu
-                    delta_tau = w(i)*((1/var_hat) - (1/var_cav)) - tau(i);
-                    delta_nu  = w(i)*((mu_hat/var_hat) - (mu_cav/var_cav)) - nu(i);
+                    delta_tau = ((1/var_hat) - (1/var_cav)) - tau(i);
+                    delta_nu  = ((mu_hat/var_hat) - (mu_cav/var_cav)) - nu(i);
 
                     % Damping helps convergence in non-log-concave regions
                     tau_new = max(tau(i) + delta_tau * opt.Damping, 0); 
@@ -1754,12 +1803,13 @@ classdef RegressionEV
                     up_denom = 1 + dt*sig_i;
 
                     % If update is too singular, skip it
-                    if abs(up_denom) > sqrt_eps
+                    if up_denom > sqrt_eps
                         K_fact = dt / up_denom;
                         mu_fact = (dn - dt*mu(i)) / up_denom;
     
                         si = Sigma(:,i);
                         Sigma = Sigma - (K_fact * si) * si';
+                        Sigma = 0.5 * (Sigma + Sigma');  % Enforce symmetry
                         mu = mu + mu_fact*si;
                         
                         tau(i) = tau_new;
@@ -1769,51 +1819,64 @@ classdef RegressionEV
 
                 % 6. Recompute globally to purge numerical drift from rank-1 updates.
                 sW = sqrt(max(tau,0));
-                B = (sW.*(K.*sW')) + speye(n);
-                L = RegressionEV.cholSafe(B);
+                scaledPrior = sW .* priorFactor;
+                [~, factorB] = qr([eye(n); scaledPrior'], 0);
+                L = factorB';
                 
-                % Scale ROWS of K (sW.*K) ensures symmetric Sigma_new
-                V = L \ (sW .* K); 
-                Sigma = K - (V' * V);
+                % Factor the posterior covariance directly to avoid K - V'*V cancellation.
+                [~, factorA] = qr([eye(n); scaledPrior], 0);
+                V = factorA' \ priorFactor';
+                Sigma = V' * V;
     
                 % Recompute mu using the corrected stable identity
                 mu = Sigma * nu + m - Sigma * (tau .* m);
                 if ~all(isfinite(mu(:)))
-                    warning('RegressionEV:EPMuNonFinite', 'EP mu became non-finite at iter %d', it);
-                    break;
+                    error('RegressionEV:EPMuNonFinite', 'EP mu became non-finite at iter %d.', it);
                 end
 
                 % Check Convergence
-                if max(abs(tau - tau_old_sweep)) < opt.Tol && max(abs(nu - nu_old_sweep)) < opt.Tol
+                if max(abs(tau - tau_old_sweep) ./ (1 + abs(tau))) < opt.Tol && ...
+                        max(abs(nu - nu_old_sweep) ./ (1 + abs(nu))) < opt.Tol
                     break; 
                 end
             end
 
-            if (it==opt.MaxIter)
+            if it == opt.MaxIter && ...
+                    (max(abs(tau - tau_old_sweep) ./ (1 + abs(tau))) >= opt.Tol || ...
+                     max(abs(nu - nu_old_sweep) ./ (1 + abs(nu))) >= opt.Tol)
                 warning('RegressionEV:MaxIterReached', ...
                     'Maximum iterations reached without convergence');
             end
 
             % 7. Recompute cavity one last time using final stable posterior
             diag_S = diag(Sigma);
-            var_cav_f = max(diag_S ./ (1 - diag_S .* tau), sqrt_eps);
-            mu_cav_f  = (mu - diag_S .* nu) ./ (1 - diag_S .* tau);
+            cavityDenom = 1 - diag_S .* tau;
+            if any(~isfinite(cavityDenom) | cavityDenom <= 0)
+                error('RegressionEV:EPInvalidCavity', 'Final EP cavity precision is nonpositive or nonfinite.');
+            end
+            var_cav_f = max(diag_S ./ cavityDenom, 1e-12);
+            mu_cav_f  = (mu - diag_S .* nu) ./ cavityDenom;
 
 
             % Compute Moment Matching Normalization (Z_hat)
             logP_sites = zeros(n,1);
             for i = 1:n
                 [~, ~, logP_sites(i)] = RegressionEV.gevTiltedMoments( ...
-                    mu_cav_f(i), var_cav_f(i), y(i), sigma, shape, ghx, ghw);
+                    mu_cav_f(i), var_cav_f(i), y(i), sigma, shape, ghx, ghw, w(i));
             end
 
             % Log-determinant of (I + S^1/2 K S^1/2)
-            logdetB = 2*sum(log(diag(L)));
+            logdetB = 2*sum(log(abs(diag(L))));
 
-            % Full Evidence (accounts for prior mean m)
-            % Terms: Site log-integrals - Complexity - Cavity/Prior Energy
-            logZ = sum(logP_sites) - 0.5*logdetB + 0.5*nu'*(Sigma*nu - 2*Sigma*(tau.*m)) ...
-                - 0.5*sum( (tau.*(mu_cav_f - m).^2) ./ (1 + tau.*var_cav_f) );
+            % EP evidence: Gaussian site partition plus tilted/site normalization corrections.
+            eta = nu - tau .* m;
+            logGaussian = -0.5*logdetB + 0.5*eta' * Sigma * eta + ...
+                nu' * m - 0.5*sum(tau .* m.^2);
+            denom = 1 + tau .* var_cav_f;
+            logSiteIntegrals = -0.5*log(denom) + nu .* mu_cav_f - ...
+                0.5*tau .* mu_cav_f.^2 + ...
+                0.5*var_cav_f .* (nu - tau .* mu_cav_f).^2 ./ denom;
+            logZ = logGaussian + sum(logP_sites - logSiteIntegrals);
 
             % Alpha used for predictions: alpha = K^-1 * (mu - m)
             alpha = nu - tau .* mu;
@@ -1920,30 +1983,42 @@ classdef RegressionEV
             if nargout > 2, W    = w .* W;    end
         end
 
-        function [muHat, varHat, logZ] = gevTiltedMoments(mu, varf, y, sigma, shape, ghx, ghw)
+        function [muHat, varHat, logZ] = gevTiltedMoments(mu, varf, y, sigma, shape, ghx, ghw, weight)
             % Compute tilted distribution moments via Gauss-Hermite quadrature.
             % Uses robust likelihood and stabilized weight normalization.
 
-            % Standard GH transformation: f = mu + sqrt(2*varf)*x
-            s = sqrt(max(2 * varf, eps));
-            f = mu + s * ghx(:);
+            if weight == 0
+                muHat = mu;
+                varHat = varf;
+                logZ = 0;
+                return;
+            end
+
+            % Center quadrature on the tilted mode, not the potentially distant cavity mean.
+            radius = 8 * (sqrt(varf) + sigma);
+            objective = @(f) 0.5*((f-mu).^2)/varf - ...
+                weight * RegressionEV.gevLogLikelihood(f, y, sigma, shape);
+            mode = fminbnd(objective, min(mu,y)-radius, max(mu,y)+radius, ...
+                optimset('Display', 'off', 'TolX', 1e-8));
+            [~, ~, curvature] = RegressionEV.gevLikelihoodMoments(mode, y, weight, sigma, shape);
+            proposalVariance = 1 / (1/varf + curvature);
+            f = mode + sqrt(2 * proposalVariance) * ghx(:);
 
             % Use the improved likelihood function
-            loglik = RegressionEV.gevLogLikelihood(f, y, sigma, shape);
+            loglik = weight * RegressionEV.gevLogLikelihood(f, y, sigma, shape);
 
             % logw_i = log(prior_weight_i) + log(likelihood_i)
             % Note: 1/sqrt(pi) is the GH normalization constant
-            logw = log(max(ghw(:), eps)) - 0.5 * log(pi) + loglik;
+            logRatio = 0.5*log(proposalVariance/varf) - ...
+                0.5*((f-mu).^2)/varf + 0.5*((f-mode).^2)/proposalVariance;
+            logw = log(ghw(:)) - 0.5 * log(pi) + loglik + logRatio;
 
             % Stabilized Log-Sum-Exp
             maxLogW = max(logw);
 
-            % Handle edge case where all weights are -Inf (no overlap)
-            if maxLogW < -1e11
-                muHat = mu;
-                varHat = varf;
-                logZ = -1e12; % Representing zero probability
-                return;
+            if ~isfinite(maxLogW)
+                error('RegressionEV:EPInvalidQuadrature', ...
+                    'EP quadrature has no finite tilted probability mass.');
             end
 
             ww = exp(logw - maxLogW);
@@ -1954,11 +2029,10 @@ classdef RegressionEV
 
             % Mean and Variance of the tilted distribution
             Ef  = sum(p .* f);
-            Ef2 = sum(p .* (f.^2));
 
             muHat  = Ef;
             % Ensure variance remains positive and stable
-            varHat = max(Ef2 - Ef^2, 1e-12 * varf);
+            varHat = max(sum(p .* (f - Ef).^2), 1e-12 * varf);
             logZ   = maxLogW + log(Z);
         end
 
@@ -2031,11 +2105,18 @@ classdef RegressionEV
             i  = (1:n-1)';
             a  = sqrt(i/2);
             CM = diag(a,1) + diag(a,-1);
-            [V,D] = eig(CM);
+            [~,D] = eig(CM);
             x = diag(D);
-            [x, idx] = sort(x);
-            V = V(:,idx);
-            w = sqrt(pi) * (V(1,:)'.^2);
+            x = sort(x);
+            % Eigenvector tails lose relative accuracy; use normalized Hermite recurrence.
+            previous = zeros(size(x));
+            current = pi^(-0.25) * ones(size(x));
+            for k = 1:n-1
+                next = sqrt(2/k) * x .* current - sqrt((k-1)/k) * previous;
+                previous = current;
+                current = next;
+            end
+            w = 1 ./ (n * current.^2);
         end
 
         function L = cholSafe(X)

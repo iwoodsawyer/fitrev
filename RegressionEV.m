@@ -1622,7 +1622,8 @@ classdef RegressionEV
                     K = sf2 * (1 + a + (a.^2)/3) .* exp(-a);
                 case "rationalquadratic"
                     alpha = theta(end);
-                    K = sf2 * (1 + (R.^2) ./ (2*alpha)).^(-alpha);
+                    % log1p avoids losing precision when the scaled distance is small.
+                    K = sf2 * exp(-alpha .* log1p((R.^2) ./ (2*alpha)));
                 otherwise
                     error('RegressionEV:BadKernel', 'Unsupported kernel: %s', name);
             end
